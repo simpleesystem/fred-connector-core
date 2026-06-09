@@ -1,0 +1,18 @@
+includes:
+    - vendor/szepeviktor/phpstan-wordpress/extension.neon
+    - vendor/phpstan/phpstan-phpunit/extension.neon
+
+parameters:
+    level: 6
+    paths:
+        - src
+        - tests
+    treatPhpDocTypesAsCertain: false
+    ignoreErrors:
+        # Test stub block sets the typed `@var` on the array global before
+        # the function declarations; PHPStan's noVariable rule is a false
+        # positive on global variable type pinning.
+        -
+            identifier: varTag.noVariable
+            paths:
+                - tests/wp-stubs.php

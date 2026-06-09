@@ -1,0 +1,54 @@
+# Lint + static analysis + tests for every PR and push to main.
+#
+# Mirrors the connector CI gate so PHPStan stays at zero errors and the
+# shared core is exercised against the WordPress stub set it depends on.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Static Analysis + Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, intl, sodium
+          coverage: none
+          tools: composer:v2
+
+      - name: Cache composer cache directory
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/composer
+          key: composer-fcc-${{ runner.os }}-${{ hashFiles('composer.json') }}
+          restore-keys: composer-fcc-${{ runner.os }}-
+
+      - name: Install composer dependencies
+        env:
+          COMPOSER_NO_INTERACTION: '1'
+        run: composer install --no-progress --prefer-dist
+
+      - name: Static analysis (PHPStan)
+        run: ./vendor/bin/phpstan analyse --memory-limit=1G --no-progress
+
+      - name: Tests (PHPUnit)
+        run: ./vendor/bin/phpunit
