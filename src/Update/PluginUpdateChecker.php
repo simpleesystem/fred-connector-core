@@ -25,6 +25,18 @@ use Simplee\FredConnector\Constants;
  * A license key is still accepted (kept for drop-in compatibility) and, when
  * present, the legacy license-gated authorize path is used instead.
  *
+ * The advertised `package` URL stays the site-local REST proxy so end users
+ * never see an SLS endpoint, but the actual install download is intercepted
+ * in-process via the `upgrader_pre_download` filter
+ * ({@see interceptPackageDownload()}): the checker resolves the SLS download
+ * URL itself and fetches it server-to-server with `download_url()`. This
+ * avoids the WordPress upgrader issuing a loopback HTTP request to the
+ * site's own public URL — a request many hosts/CDNs reject (PHP worker
+ * exhaustion, bot challenges on the host's own egress IP), which historically
+ * surfaced as an opaque "Download failed. Service Unavailable." The REST
+ * proxy remains registered as a back-compat fallback and for manual
+ * downloads.
+ *
  * All WordPress collaborators (HTTP, transient cache) are injected so the
  * protocol logic is unit-testable without a live WordPress request
  * lifecycle; {@see registerUpdateHooks()} adapts the testable methods to the
@@ -64,11 +76,35 @@ final class PluginUpdateChecker
     private $domainResolver;
 
     /**
+     * Fetches a remote URL to a local temp file. Returns the file path on
+     * success, a WP_Error-shaped object on failure, or null when no
+     * downloader is available in this runtime (signals "fall back to the
+     * WordPress default download path").
+     *
+     * @var callable(string): mixed
+     */
+    private $fileDownloader;
+
+    /**
+     * @var callable(string): void
+     */
+    private $logger;
+
+    /**
+     * The stage at which the most recent {@see authorizeDownloadUrl()} call
+     * failed, or null when it succeeded. One of the
+     * Constants::UPDATE_FAILURE_STAGE_* values.
+     */
+    private ?string $lastAuthorizeFailureStage = null;
+
+    /**
      * @param  (callable(string, array<string, mixed>): (array<string, mixed>|null))|null  $httpPost  POST JSON, decode response (null on failure)
      * @param  (callable(string): mixed)|null  $getTransient
      * @param  (callable(string, mixed, int): bool)|null  $setTransient
      * @param  (callable(string): bool)|null  $deleteTransient
      * @param  (callable(): string)|null  $domainResolver  fallback domain when none configured
+     * @param  (callable(string): mixed)|null  $fileDownloader  fetch a URL to a local temp file (defaults to WP `download_url()`)
+     * @param  (callable(string): void)|null  $logger  diagnostic sink (defaults to `error_log`)
      */
     public function __construct(
         private readonly string $pluginSlug,
@@ -84,6 +120,8 @@ final class PluginUpdateChecker
         ?callable $deleteTransient = null,
         ?callable $domainResolver = null,
         ?string $transientPrefix = null,
+        ?callable $fileDownloader = null,
+        ?callable $logger = null,
     ) {
         $this->baseUrl = rtrim($baseUrl, '/');
         $this->transientPrefix = ($transientPrefix === null || $transientPrefix === '')
@@ -103,6 +141,16 @@ final class PluginUpdateChecker
 
             return '';
         };
+        $this->fileDownloader = $fileDownloader ?? static function (string $url): mixed {
+            if (! function_exists('download_url')) {
+                return null;
+            }
+
+            return download_url($url, Constants::UPDATE_DOWNLOAD_TIMEOUT_SECONDS);
+        };
+        $this->logger = $logger ?? static function (string $message): void {
+            error_log($message);
+        };
     }
 
     public function registerUpdateHooks(): void
@@ -113,6 +161,12 @@ final class PluginUpdateChecker
 
         add_filter(Constants::WP_FILTER_PRE_SET_SITE_TRANSIENT_UPDATE_PLUGINS, [$this, 'injectUpdateData']);
         add_filter(Constants::WP_FILTER_PLUGINS_API, [$this, 'injectPluginInfo'], 10, 3);
+        add_filter(
+            Constants::WP_FILTER_UPGRADER_PRE_DOWNLOAD,
+            [$this, 'interceptPackageDownload'],
+            10,
+            Constants::WP_FILTER_UPGRADER_PRE_DOWNLOAD_ARG_COUNT,
+        );
         add_action(Constants::WP_ACTION_REST_API_INIT, [$this, 'registerRestRoute']);
         add_action(Constants::WP_ACTION_DELETE_SITE_TRANSIENT_UPDATE_PLUGINS, [$this, 'clearUpdateCache']);
     }
@@ -328,7 +382,10 @@ final class PluginUpdateChecker
      */
     public function authorizeDownloadUrl(): ?string
     {
+        $this->lastAuthorizeFailureStage = null;
         if ($this->baseUrl === '') {
+            $this->lastAuthorizeFailureStage = Constants::UPDATE_FAILURE_STAGE_BASE_URL_MISSING;
+
             return null;
         }
 
@@ -336,7 +393,14 @@ final class PluginUpdateChecker
         $update = is_array($result) ? ($result[Constants::UPDATE_RESPONSE_KEY_UPDATE] ?? null) : null;
 
         if ($this->licenseKey === '') {
-            return $this->keylessDownloadUrl($update);
+            $url = $this->keylessDownloadUrl($update);
+            if ($url === null) {
+                $this->lastAuthorizeFailureStage = $result === null
+                    ? Constants::UPDATE_FAILURE_STAGE_CHECK_FAILED
+                    : Constants::UPDATE_FAILURE_STAGE_NO_UPDATE_VERSION;
+            }
+
+            return $url;
         }
 
         if (is_array($update)
@@ -363,12 +427,29 @@ final class PluginUpdateChecker
 
         $parsed = ($this->httpPost)($this->baseUrl.Constants::API_ENDPOINT_DOWNLOADS_AUTHORIZE, $payload);
         if (! is_array($parsed) || empty($parsed[Constants::UPDATE_RESPONSE_KEY_SUCCESS])) {
+            $this->lastAuthorizeFailureStage = Constants::UPDATE_FAILURE_STAGE_AUTHORIZE_FAILED;
+
             return null;
         }
 
         $url = isset($parsed[Constants::UPDATE_RESPONSE_KEY_DOWNLOAD_URL]) ? (string) $parsed[Constants::UPDATE_RESPONSE_KEY_DOWNLOAD_URL] : '';
+        if ($url === '') {
+            $this->lastAuthorizeFailureStage = Constants::UPDATE_FAILURE_STAGE_AUTHORIZE_FAILED;
 
-        return $url !== '' ? $url : null;
+            return null;
+        }
+
+        return $url;
+    }
+
+    /**
+     * The stage at which the most recent {@see authorizeDownloadUrl()} call
+     * failed (a Constants::UPDATE_FAILURE_STAGE_* value), or null when it
+     * succeeded.
+     */
+    public function lastAuthorizeFailureStage(): ?string
+    {
+        return $this->lastAuthorizeFailureStage;
     }
 
     /**
@@ -399,9 +480,83 @@ final class PluginUpdateChecker
     }
 
     /**
+     * `upgrader_pre_download` filter: when WordPress is about to download
+     * this plugin's `package` URL (the site-local REST proxy), resolve the
+     * SLS download URL in-process and fetch it server-to-server instead.
+     *
+     * This prevents the upgrader from issuing a loopback HTTP request to the
+     * site's own public URL — the request that hosts/CDNs answer with an
+     * opaque 503 ("Download failed. Service Unavailable.") while external
+     * fetches of the very same proxy URL succeed. The wp-admin UI keeps
+     * displaying only the proxy URL, so the SLS endpoint stays hidden from
+     * end users.
+     *
+     * @param  mixed  $reply  false to let WordPress download normally; a file path or WP_Error short-circuits
+     * @param  mixed  $package  the package URL the upgrader wants to download
+     * @param  mixed  $upgrader  WP_Upgrader instance (unused)
+     * @param  mixed  $hookExtra  upgrade context (unused)
+     * @return mixed local zip path, WP_Error with the failing stage, or the untouched $reply
+     */
+    public function interceptPackageDownload(
+        mixed $reply,
+        mixed $package,
+        mixed $upgrader = null,
+        mixed $hookExtra = null,
+    ): mixed {
+        unset($upgrader, $hookExtra);
+        if ($reply !== false) {
+            return $reply;
+        }
+        if (! is_string($package) || $package === '' || ! $this->isOwnProxyPackageUrl($package)) {
+            return $reply;
+        }
+
+        $downloadUrl = $this->authorizeDownloadUrl();
+        if ($downloadUrl === null) {
+            $stage = $this->lastAuthorizeFailureStage ?? Constants::UPDATE_FAILURE_STAGE_UNKNOWN;
+            ($this->logger)(
+                Constants::UPDATE_LOG_PREFIX
+                .sprintf(Constants::UPDATE_LOG_PRE_DOWNLOAD_RESOLVE_FAILED, $this->pluginSlug, $stage)
+            );
+
+            return $this->restError(
+                Constants::UPDATE_ERROR_CODE_PACKAGE_RESOLVE_FAILED,
+                sprintf(Constants::UPDATE_ERROR_MESSAGE_PACKAGE_RESOLVE_FAILED, $this->pluginSlug, $stage),
+                Constants::HTTP_SERVICE_UNAVAILABLE,
+            );
+        }
+
+        $file = ($this->fileDownloader)($downloadUrl);
+        if ($file === null) {
+            // No downloader in this runtime — fall back to the WordPress
+            // default download path (the REST proxy keeps working).
+            return $reply;
+        }
+        if (is_string($file) && $file !== '') {
+            return $file;
+        }
+
+        $detail = self::describeDownloadError($file);
+        ($this->logger)(
+            Constants::UPDATE_LOG_PREFIX
+            .sprintf(Constants::UPDATE_LOG_PRE_DOWNLOAD_FETCH_FAILED, $this->pluginSlug, $detail)
+        );
+
+        return $this->restError(
+            Constants::UPDATE_ERROR_CODE_PACKAGE_FETCH_FAILED,
+            sprintf(Constants::UPDATE_ERROR_MESSAGE_PACKAGE_FETCH_FAILED, $this->pluginSlug, $detail),
+            Constants::HTTP_SERVICE_UNAVAILABLE,
+        );
+    }
+
+    /**
      * REST download proxy. WordPress fetches this URL to install the update;
      * it 302s to the signed SLS download. Returns a WP_Error only on
      * failure (the success path redirects and exits).
+     *
+     * Kept as a back-compat fallback (and for manual downloads) now that the
+     * upgrader path is intercepted in-process by
+     * {@see interceptPackageDownload()}.
      *
      * @param  object|array<string, mixed>|mixed  $request  WP_REST_Request (loosely typed for tests)
      * @return mixed
@@ -434,9 +589,15 @@ final class PluginUpdateChecker
             exit;
         }
 
+        $stage = $this->lastAuthorizeFailureStage ?? Constants::UPDATE_FAILURE_STAGE_UNKNOWN;
+        ($this->logger)(
+            Constants::UPDATE_LOG_PREFIX
+            .sprintf(Constants::UPDATE_LOG_PROXY_DOWNLOAD_UNAVAILABLE, $this->pluginSlug, $stage)
+        );
+
         return $this->restError(
             Constants::REST_ERROR_CODE_DOWNLOAD_UNAVAILABLE,
-            Constants::REST_ERROR_MESSAGE_DOWNLOAD_UNAVAILABLE,
+            sprintf(Constants::REST_ERROR_MESSAGE_DOWNLOAD_UNAVAILABLE_WITH_STAGE, $stage),
             Constants::HTTP_SERVICE_UNAVAILABLE,
         );
     }
@@ -448,7 +609,7 @@ final class PluginUpdateChecker
 
     public function downloadProxyUrl(): string
     {
-        $route = '/'.ltrim(Constants::UPDATE_REST_NAMESPACE, '/').'/download/'.rawurlencode($this->pluginSlug);
+        $route = $this->downloadRoutePath();
         if (function_exists('rest_url')) {
             return (string) rest_url($route);
         }
@@ -457,6 +618,72 @@ final class PluginUpdateChecker
         }
 
         return '/wp-json'.$route;
+    }
+
+    /**
+     * The REST route path for this plugin's download proxy, e.g.
+     * `/fred-cloud-updates/v1/download/<slug>`.
+     */
+    private function downloadRoutePath(): string
+    {
+        return '/'.ltrim(Constants::UPDATE_REST_NAMESPACE, '/')
+            .Constants::UPDATE_REST_ROUTE_DOWNLOAD_PATH_PREFIX
+            .rawurlencode($this->pluginSlug);
+    }
+
+    /**
+     * Whether the given package URL is THIS plugin's site-local download
+     * proxy. Matches on the REST route path + slug so it stays robust to
+     * home-URL variations (scheme, www, subdirectory installs) and to
+     * plain-permalink `?rest_route=` style REST URLs. Other plugins'
+     * packages — including the sibling connector sharing the REST
+     * namespace — never match because the slug is part of the route.
+     */
+    private function isOwnProxyPackageUrl(string $package): bool
+    {
+        $route = $this->downloadRoutePath();
+
+        $path = parse_url($package, PHP_URL_PATH);
+        if (is_string($path) && self::pathMatchesRoute($path, $route)) {
+            return true;
+        }
+
+        $query = parse_url($package, PHP_URL_QUERY);
+        if (is_string($query) && $query !== '') {
+            parse_str($query, $params);
+            $restRoute = $params[Constants::UPDATE_REST_QUERY_PARAM_REST_ROUTE] ?? null;
+            if (is_string($restRoute) && self::pathMatchesRoute($restRoute, $route)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Route-boundary-aware containment check: the candidate must end at the
+     * route or continue with a path separator, so slugs that merely share a
+     * prefix never match.
+     */
+    private static function pathMatchesRoute(string $candidate, string $route): bool
+    {
+        return str_ends_with($candidate, $route) || str_contains($candidate, $route.'/');
+    }
+
+    /**
+     * Human-readable detail for a failed file download (WP_Error or any
+     * unexpected non-path result).
+     */
+    private static function describeDownloadError(mixed $error): string
+    {
+        if (is_object($error) && method_exists($error, 'get_error_message')) {
+            $message = (string) $error->get_error_message();
+            if ($message !== '') {
+                return $message;
+            }
+        }
+
+        return Constants::UPDATE_ERROR_DETAIL_UNKNOWN;
     }
 
     private function resolveDomain(): string

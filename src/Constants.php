@@ -111,9 +111,14 @@ final class Constants
     public const UPDATE_TRANSIENT_VERSION_SANITIZE_REPLACEMENT = '_';
     public const UPDATE_REST_NAMESPACE = 'fred-cloud-updates/v1';
     public const UPDATE_REST_ROUTE_DOWNLOAD = '/download/(?P<slug>[A-Za-z0-9._-]+)';
+    public const UPDATE_REST_ROUTE_DOWNLOAD_PATH_PREFIX = '/download/';
     public const UPDATE_REST_PARAM_SLUG = 'slug';
+    public const UPDATE_REST_QUERY_PARAM_REST_ROUTE = 'rest_route';
+    public const UPDATE_DOWNLOAD_TIMEOUT_SECONDS = 300;
     public const WP_FILTER_PRE_SET_SITE_TRANSIENT_UPDATE_PLUGINS = 'pre_set_site_transient_update_plugins';
     public const WP_FILTER_PLUGINS_API = 'plugins_api';
+    public const WP_FILTER_UPGRADER_PRE_DOWNLOAD = 'upgrader_pre_download';
+    public const WP_FILTER_UPGRADER_PRE_DOWNLOAD_ARG_COUNT = 4;
     public const WP_ACTION_DELETE_SITE_TRANSIENT_UPDATE_PLUGINS = 'delete_site_transient_update_plugins';
     public const WP_ACTION_REST_API_INIT = 'rest_api_init';
     public const PLUGINS_API_ACTION_INFORMATION = 'plugin_information';
@@ -140,4 +145,19 @@ final class Constants
     public const REST_ERROR_CODE_DOWNLOAD_UNAVAILABLE = 'fred_cloud_update_download_unavailable';
     public const REST_ERROR_MESSAGE_SLUG_MISMATCH = 'Requested slug does not match this plugin instance.';
     public const REST_ERROR_MESSAGE_DOWNLOAD_UNAVAILABLE = 'License download authorization is currently unavailable.';
+    public const REST_ERROR_MESSAGE_DOWNLOAD_UNAVAILABLE_WITH_STAGE = 'License download authorization is currently unavailable (stage: %s).';
+    public const UPDATE_LOG_PREFIX = '[Fred Connector Update] ';
+    public const UPDATE_LOG_PROXY_DOWNLOAD_UNAVAILABLE = 'download proxy returning 503 for slug "%s": authorization failed at stage "%s".';
+    public const UPDATE_LOG_PRE_DOWNLOAD_RESOLVE_FAILED = 'in-process package resolve failed for slug "%s" at stage "%s".';
+    public const UPDATE_LOG_PRE_DOWNLOAD_FETCH_FAILED = 'in-process package fetch failed for slug "%s": %s';
+    public const UPDATE_FAILURE_STAGE_BASE_URL_MISSING = 'base_url_missing';
+    public const UPDATE_FAILURE_STAGE_CHECK_FAILED = 'update_check_failed';
+    public const UPDATE_FAILURE_STAGE_NO_UPDATE_VERSION = 'no_update_version';
+    public const UPDATE_FAILURE_STAGE_AUTHORIZE_FAILED = 'license_authorize_failed';
+    public const UPDATE_FAILURE_STAGE_UNKNOWN = 'unknown';
+    public const UPDATE_ERROR_CODE_PACKAGE_RESOLVE_FAILED = 'fred_cloud_update_package_resolve_failed';
+    public const UPDATE_ERROR_CODE_PACKAGE_FETCH_FAILED = 'fred_cloud_update_package_fetch_failed';
+    public const UPDATE_ERROR_MESSAGE_PACKAGE_RESOLVE_FAILED = 'Could not resolve the update download for "%s" from the license server (stage: %s). The in-process downloader bypassed the site-local proxy; verify the license server is reachable from this host.';
+    public const UPDATE_ERROR_MESSAGE_PACKAGE_FETCH_FAILED = 'Downloading the update for "%s" from the license server failed: %s';
+    public const UPDATE_ERROR_DETAIL_UNKNOWN = 'unknown error';
 }

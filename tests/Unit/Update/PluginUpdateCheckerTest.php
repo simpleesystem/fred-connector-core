@@ -28,6 +28,22 @@ final class PluginUpdateCheckerTest extends TestCase
 
     private const SIGNED_URL = 'https://cdn.simpleaisystem.com/dl/fred-cloud-woocommerce-1.0.7.zip?token=xyz';
 
+    private const PROXY_PACKAGE_URL = 'https://talktofred.ai/wp-json/fred-cloud-updates/v1/download/fred-cloud-woocommerce';
+
+    private const PROXY_PACKAGE_URL_SUBDIR = 'http://www.other.example/blog/wp-json/fred-cloud-updates/v1/download/fred-cloud-woocommerce/';
+
+    private const PROXY_PACKAGE_URL_PLAIN_PERMALINKS = 'https://talktofred.ai/?rest_route=/fred-cloud-updates/v1/download/fred-cloud-woocommerce';
+
+    private const FOREIGN_PACKAGE_URL = 'https://downloads.wordpress.org/plugin/some-other-plugin.1.2.3.zip';
+
+    private const PREFIX_COLLISION_PACKAGE_URL = 'https://talktofred.ai/wp-json/fred-cloud-updates/v1/download/fred-cloud-woocommerce-pro';
+
+    private const LOCAL_ZIP_PATH = '/tmp/fred-cloud-woocommerce-update.zip';
+
+    private const DOWNLOAD_ERROR_DETAIL = 'cURL error 28: connection timed out';
+
+    private const REPLY_ALREADY_HANDLED = '/tmp/already-downloaded.zip';
+
     /**
      * @var array<string, mixed>
      */
@@ -38,19 +54,33 @@ final class PluginUpdateCheckerTest extends TestCase
      */
     private array $calls = [];
 
+    /**
+     * @var list<string>
+     */
+    private array $downloadedUrls = [];
+
+    /**
+     * @var list<string>
+     */
+    private array $logLines = [];
+
     protected function setUp(): void
     {
         $this->store = [];
         $this->calls = [];
+        $this->downloadedUrls = [];
+        $this->logLines = [];
     }
 
     /**
      * @param  callable(string, array<string, mixed>): (array<string, mixed>|null)  $httpPost
+     * @param  (callable(string): mixed)|null  $fileDownloader
      */
     private function checker(
         callable $httpPost,
         string $current = self::CURRENT_VERSION,
         string $license = self::LICENSE,
+        ?callable $fileDownloader = null,
     ): PluginUpdateChecker {
         return new PluginUpdateChecker(
             pluginSlug: self::SLUG,
@@ -73,7 +103,37 @@ final class PluginUpdateCheckerTest extends TestCase
                 return true;
             },
             domainResolver: static fn (): string => self::DOMAIN,
+            fileDownloader: $fileDownloader ?? function (string $url): mixed {
+                $this->downloadedUrls[] = $url;
+
+                return self::LOCAL_ZIP_PATH;
+            },
+            logger: function (string $message): void {
+                $this->logLines[] = $message;
+            },
         );
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function keylessUpdateAvailableResponse(): array
+    {
+        return [
+            Constants::UPDATE_RESPONSE_KEY_SUCCESS => true,
+            Constants::UPDATE_RESPONSE_KEY_LATEST_VERSION => self::NEWER_VERSION,
+            Constants::UPDATE_RESPONSE_KEY_UPDATE => [
+                Constants::UPDATE_PAYLOAD_KEY_VERSION => self::NEWER_VERSION,
+            ],
+        ];
+    }
+
+    private function expectedKeylessDownloadUrl(): string
+    {
+        return self::BASE_URL
+            .Constants::API_ENDPOINT_UPDATES_DOWNLOAD
+            .'?'.Constants::UPDATE_PAYLOAD_KEY_SLUG.'='.rawurlencode(self::SLUG)
+            .'&'.Constants::UPDATE_PAYLOAD_KEY_VERSION.'='.rawurlencode(self::NEWER_VERSION);
     }
 
     /**
@@ -86,6 +146,18 @@ final class PluginUpdateCheckerTest extends TestCase
             $this->calls[] = ['url' => $url, 'payload' => $payload];
 
             return $response;
+        };
+    }
+
+    /**
+     * @return callable(string, array<string, mixed>): (array<string, mixed>|null)
+     */
+    private function failingHttp(): callable
+    {
+        return function (string $url, array $payload): ?array {
+            $this->calls[] = ['url' => $url, 'payload' => $payload];
+
+            return null;
         };
     }
 
@@ -374,5 +446,176 @@ final class PluginUpdateCheckerTest extends TestCase
 
         $checker->clearUpdateCache();
         $this->assertSame([], $this->store);
+    }
+
+    public function test_intercept_resolves_own_proxy_package_in_process_and_returns_the_local_file(): void
+    {
+        $checker = $this->checker($this->recordingHttp($this->keylessUpdateAvailableResponse()), license: '');
+
+        $result = $checker->interceptPackageDownload(false, self::PROXY_PACKAGE_URL);
+
+        $this->assertSame(self::LOCAL_ZIP_PATH, $result);
+        $this->assertSame([$this->expectedKeylessDownloadUrl()], $this->downloadedUrls);
+    }
+
+    public function test_intercept_matches_proxy_url_on_subdirectory_installs_with_home_url_variations(): void
+    {
+        $checker = $this->checker($this->recordingHttp($this->keylessUpdateAvailableResponse()), license: '');
+
+        $result = $checker->interceptPackageDownload(false, self::PROXY_PACKAGE_URL_SUBDIR);
+
+        $this->assertSame(self::LOCAL_ZIP_PATH, $result);
+    }
+
+    public function test_intercept_matches_proxy_url_in_plain_permalink_rest_route_form(): void
+    {
+        $checker = $this->checker($this->recordingHttp($this->keylessUpdateAvailableResponse()), license: '');
+
+        $result = $checker->interceptPackageDownload(false, self::PROXY_PACKAGE_URL_PLAIN_PERMALINKS);
+
+        $this->assertSame(self::LOCAL_ZIP_PATH, $result);
+    }
+
+    public function test_intercept_ignores_packages_of_other_plugins(): void
+    {
+        $checker = $this->checker($this->recordingHttp($this->keylessUpdateAvailableResponse()), license: '');
+
+        $result = $checker->interceptPackageDownload(false, self::FOREIGN_PACKAGE_URL);
+
+        $this->assertFalse($result);
+        $this->assertSame([], $this->downloadedUrls);
+        $this->assertCount(0, $this->calls, 'Foreign packages must not trigger any SLS traffic.');
+    }
+
+    public function test_intercept_ignores_slugs_that_merely_share_a_prefix(): void
+    {
+        $checker = $this->checker($this->recordingHttp($this->keylessUpdateAvailableResponse()), license: '');
+
+        $result = $checker->interceptPackageDownload(false, self::PREFIX_COLLISION_PACKAGE_URL);
+
+        $this->assertFalse($result);
+        $this->assertSame([], $this->downloadedUrls);
+    }
+
+    public function test_intercept_leaves_an_already_handled_reply_untouched(): void
+    {
+        $checker = $this->checker($this->recordingHttp($this->keylessUpdateAvailableResponse()), license: '');
+
+        $result = $checker->interceptPackageDownload(self::REPLY_ALREADY_HANDLED, self::PROXY_PACKAGE_URL);
+
+        $this->assertSame(self::REPLY_ALREADY_HANDLED, $result);
+        $this->assertSame([], $this->downloadedUrls);
+    }
+
+    public function test_intercept_returns_a_descriptive_error_when_no_download_can_be_resolved(): void
+    {
+        $checker = $this->checker($this->recordingHttp([
+            Constants::UPDATE_RESPONSE_KEY_SUCCESS => true,
+            Constants::UPDATE_RESPONSE_KEY_LATEST_VERSION => self::CURRENT_VERSION,
+        ]), license: '');
+
+        $result = $checker->interceptPackageDownload(false, self::PROXY_PACKAGE_URL);
+
+        $this->assertInstanceOf(WP_Error::class, $result);
+        $this->assertSame(Constants::UPDATE_ERROR_CODE_PACKAGE_RESOLVE_FAILED, $result->get_error_code());
+        $this->assertStringContainsString(Constants::UPDATE_FAILURE_STAGE_NO_UPDATE_VERSION, $result->get_error_message());
+        $this->assertNotSame([], $this->logLines, 'A resolve failure must be logged.');
+    }
+
+    public function test_intercept_reports_the_check_failed_stage_when_sls_is_unreachable(): void
+    {
+        $checker = $this->checker($this->failingHttp(), license: '');
+
+        $result = $checker->interceptPackageDownload(false, self::PROXY_PACKAGE_URL);
+
+        $this->assertInstanceOf(WP_Error::class, $result);
+        $this->assertStringContainsString(Constants::UPDATE_FAILURE_STAGE_CHECK_FAILED, $result->get_error_message());
+    }
+
+    public function test_intercept_wraps_file_download_failures_in_a_descriptive_error(): void
+    {
+        $checker = $this->checker(
+            $this->recordingHttp($this->keylessUpdateAvailableResponse()),
+            license: '',
+            fileDownloader: static fn (string $url): mixed => new WP_Error(
+                Constants::UPDATE_ERROR_CODE_PACKAGE_FETCH_FAILED,
+                self::DOWNLOAD_ERROR_DETAIL,
+            ),
+        );
+
+        $result = $checker->interceptPackageDownload(false, self::PROXY_PACKAGE_URL);
+
+        $this->assertInstanceOf(WP_Error::class, $result);
+        $this->assertSame(Constants::UPDATE_ERROR_CODE_PACKAGE_FETCH_FAILED, $result->get_error_code());
+        $this->assertStringContainsString(self::DOWNLOAD_ERROR_DETAIL, $result->get_error_message());
+        $this->assertNotSame([], $this->logLines, 'A fetch failure must be logged.');
+    }
+
+    public function test_intercept_falls_back_to_the_default_download_path_without_a_downloader(): void
+    {
+        $checker = $this->checker(
+            $this->recordingHttp($this->keylessUpdateAvailableResponse()),
+            license: '',
+            fileDownloader: static fn (string $url): mixed => null,
+        );
+
+        $result = $checker->interceptPackageDownload(false, self::PROXY_PACKAGE_URL);
+
+        $this->assertFalse($result);
+    }
+
+    public function test_authorize_failure_stage_is_null_after_a_successful_keyless_resolve(): void
+    {
+        $checker = $this->checker($this->recordingHttp($this->keylessUpdateAvailableResponse()), license: '');
+
+        $checker->authorizeDownloadUrl();
+
+        $this->assertNull($checker->lastAuthorizeFailureStage());
+    }
+
+    public function test_licensed_authorize_failure_reports_the_authorize_stage(): void
+    {
+        $checker = $this->checker($this->recordingHttp([
+            Constants::UPDATE_RESPONSE_KEY_SUCCESS => false,
+        ]));
+
+        $this->assertNull($checker->authorizeDownloadUrl());
+        $this->assertSame(Constants::UPDATE_FAILURE_STAGE_AUTHORIZE_FAILED, $checker->lastAuthorizeFailureStage());
+    }
+
+    public function test_download_proxy_unavailable_path_logs_the_failing_stage(): void
+    {
+        $checker = $this->checker($this->recordingHttp([
+            Constants::UPDATE_RESPONSE_KEY_SUCCESS => true,
+            Constants::UPDATE_RESPONSE_KEY_LATEST_VERSION => self::CURRENT_VERSION,
+        ]), license: '');
+
+        $request = new WP_REST_Request;
+        $request->set_param(Constants::UPDATE_REST_PARAM_SLUG, self::SLUG);
+
+        $error = $checker->handleDownloadProxyRest($request);
+
+        $this->assertInstanceOf(WP_Error::class, $error);
+        $this->assertSame(Constants::REST_ERROR_CODE_DOWNLOAD_UNAVAILABLE, $error->get_error_code());
+        $this->assertStringContainsString(Constants::UPDATE_FAILURE_STAGE_NO_UPDATE_VERSION, $error->get_error_message());
+        $this->assertCount(1, $this->logLines);
+        $this->assertStringContainsString(Constants::UPDATE_FAILURE_STAGE_NO_UPDATE_VERSION, $this->logLines[0]);
+    }
+
+    public function test_register_update_hooks_wires_the_pre_download_interceptor(): void
+    {
+        $checker = $this->checker($this->recordingHttp([]));
+
+        $checker->registerUpdateHooks();
+
+        $records = $GLOBALS['__wp_filters_fixture'] ?? [];
+        $this->assertIsArray($records);
+        $hooks = [];
+        foreach ($records as $record) {
+            if (is_array($record) && isset($record['hook'])) {
+                $hooks[] = (string) $record['hook'];
+            }
+        }
+        $this->assertContains(Constants::WP_FILTER_UPGRADER_PRE_DOWNLOAD, $hooks);
     }
 }
