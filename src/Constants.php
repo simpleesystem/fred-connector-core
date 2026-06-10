@@ -16,11 +16,20 @@ namespace Simplee\FredConnector;
 final class Constants
 {
     public const HTTP_OK = 200;
+    public const HTTP_MULTIPLE_CHOICES = 300;
     public const HTTP_FOUND = 302;
     public const HTTP_BAD_REQUEST = 400;
+    public const HTTP_UNAUTHORIZED = 401;
     public const HTTP_NOT_FOUND = 404;
+    public const HTTP_INTERNAL_SERVER_ERROR = 500;
     public const HTTP_SERVICE_UNAVAILABLE = 503;
     public const API_ENDPOINT_QOS_SCHEMA = '/v1/vendor/qos/schema';
+    public const CONNECTION_PROBE_MAX_ATTEMPTS = 4;
+    public const ADMIN_NOTICE_HTML_OPEN = '<div class="';
+    public const ADMIN_NOTICE_HTML_MIDDLE = '"><p>';
+    public const ADMIN_NOTICE_HTML_CLOSE = '</p></div>';
+    public const ADMIN_NOTICE_CLASS_ERROR = 'notice notice-error';
+    public const ADMIN_NOTICE_CLASS_SUCCESS = 'notice notice-success';
     public const HEADER_AUTHORIZATION = 'Authorization';
     public const HEADER_CONTENT_TYPE = 'Content-Type';
     public const HEADER_ACCEPT = 'Accept';

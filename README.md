@@ -23,6 +23,14 @@ update transient prefix, default audiences) are injected by the consumer.
   authorization-code store, token factory, discovery, PKCE. Connector-specific
   option keys (signing key, clients, login-portal) are injected.
 - `Auth/` — handoff principal + role/principal resolution.
+- `Config/BaseUrlResolver` — effective Fred Cloud base-URL resolution (saved
+  override or injected production default; never the empty string). The
+  option key and default URL are injected per connector.
+- `Health/ConnectionProbe` — live authenticated connectivity probe against
+  `GET /v1/vendor/qos/schema` with cold-start retry semantics (5xx/transport
+  retried up to max attempts; other 4xx definitive; empty config false).
+- `Ui/ConnectionStatus` — connection-status evaluation + admin-notice
+  rendering. The notice copy (product label) is injected per connector.
 - `Resources/` — `Customer`, `QosBundle` value objects.
 - `Exceptions/` — the Fred Cloud exception hierarchy.
 - `Constants` — protocol/framework constants shared by the above (HTTP codes,
